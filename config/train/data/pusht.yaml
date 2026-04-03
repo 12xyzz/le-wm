@@ -1,7 +1,9 @@
+preset: pusht
+
 dataset:
+  name: pusht_expert_train
   num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
   frameskip: 5
-  name: pusht_expert_train
   keys_to_load:
     - pixels
     - action

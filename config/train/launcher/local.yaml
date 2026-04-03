@@ -1,11 +1,20 @@
 # @package _global_
-# Local launcher configuration (no SLURM)
+# Local launcher configuration
 
 defaults:
+  - override /hydra/job_logging: disabled
+  - override /hydra/hydra_logging: disabled
   - override /hydra/launcher: basic
 
 wandb:
   enabled: True
   config:
-    project: le-wm
-    entity: le-wm
+    entity: 12xyzz
+    project: lewm
+    resume: allow
+    log_model: False
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

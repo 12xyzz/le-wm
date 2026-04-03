@@ -1,7 +1,14 @@
 # @package _global_
-# Local launcher configuration (no SLURM)
+# Local launcher configuration
 
 defaults:
+  - override /hydra/job_logging: disabled
+  - override /hydra/hydra_logging: disabled
   - override /hydra/launcher: basic
 
 cache_dir: null # use stable-worldmodel default cache
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

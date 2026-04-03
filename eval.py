@@ -99,11 +99,14 @@ def run(cfg: DictConfig):
     else:
         policy = swm.policy.RandomPolicy()
 
-    results_path = (
+    results_base = (
         Path(swm.data.utils.get_cache_dir(), cfg.policy).parent
         if cfg.policy != "random"
         else Path(__file__).parent
     )
+
+    rollout_dir = (results_base.parent if cfg.policy != "random" else results_base) / "rollout"
+    rollout_dir.mkdir(parents=True, exist_ok=True)
 
     # sample the episodes and the starting indices
     episode_len = get_episodes_length(dataset, ep_indices)
@@ -146,16 +149,16 @@ def run(cfg: DictConfig):
         eval_budget=cfg.eval.eval_budget,
         episodes_idx=eval_episodes.tolist(),
         callables=OmegaConf.to_container(cfg.eval.get("callables"), resolve=True),
-        video_path=results_path,
+        video_path=rollout_dir,
     )
     end_time = time.time()
     
     print(metrics)
+    
+    results_file = (results_base.parent if cfg.policy != "random" else results_base) / cfg.output.filename
+    results_file.parent.mkdir(parents=True, exist_ok=True)
 
-    results_path = results_path / cfg.output.filename
-    results_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with results_path.open("a") as f:
+    with results_file.open("a") as f:
         f.write("\n")  # separate from previous runs
 
         f.write("==== CONFIG ====\n")

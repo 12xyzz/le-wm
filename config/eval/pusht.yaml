@@ -45,4 +45,4 @@ eval:
           value: goal_state
           
 output:
-  filename: pusht_results.txt
+  filename: pusht_eval_results.txt

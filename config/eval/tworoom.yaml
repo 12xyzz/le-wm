@@ -44,4 +44,4 @@ eval:
           value: goal_proprio
 
 output:
-  filename: tworoom_results.txt
+  filename: tworoom_eval_results.txt

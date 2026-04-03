@@ -1,9 +1,12 @@
 defaults:
   - _self_
-  - data: pusht
+  - data: pusht # CLI overrides: python train.py data=<name>
+  - launcher: local
 
-output_model_name: lewm
-subdir: ${hydra:job.id}
+STABLEWM_HOME: "/scratch/u6gn/xuanya.u6gn/stablewm"
+output_model_name: lewm-${data.preset}-curve
+subdir: ${now:%m%d%H%M}_${oc.env:SLURM_JOB_ID,local}
+run_dir: ${STABLEWM_HOME}/${data.preset}/${subdir}
 
 num_workers: 6
 train_split: 0.9
@@ -13,8 +16,15 @@ patch_size: 14
 encoder_scale: tiny
 dump_object: True
 
+wandb:
+  enabled: True
+  config:
+    name: ${output_model_name}
+    id: ${subdir}
+    save_dir: ${run_dir}
+
 trainer:
-  max_epochs: 100
+  max_epochs: 10
   devices: auto
   accelerator: gpu
   precision: bf16
@@ -31,16 +41,6 @@ optimizer:
   type: AdamW
   lr: 5e-5
   weight_decay: 1e-3
-
-wandb:
-  enabled: True
-  config:
-    entity: lewm
-    project: lewm
-    name: ${output_model_name}
-    id: ${subdir}
-    resume: allow
-    log_model: False
 
 wm:
   type: lewm
@@ -62,3 +62,7 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+  curve:
+    enabled: true
+    weight: 0.1
+    step_thresh: 1e-6

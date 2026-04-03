@@ -1,5 +1,7 @@
+preset: cube
+
 dataset:
-  name: ogbench/cube_single_expert
+  name: cube_single_expert
   num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
   frameskip: 5
   keys_to_load:
