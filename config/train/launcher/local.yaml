@@ -10,7 +10,7 @@ wandb:
   enabled: True
   config:
     entity: 12xyzz
-    project: lewm
+    project: subjepa
     resume: allow
     log_model: False
 

@@ -4,7 +4,7 @@ defaults:
   - launcher: local
 
 STABLEWM_HOME: "/projects/u6gn/xuanya.u6gn/stablewm"
-output_model_name: base
+output_model_name: curve
 subdir: ${now:%m%d%H%M}_${oc.env:SLURM_JOB_ID,local}
 run_dir: ${STABLEWM_HOME}/${data.preset}/${subdir}
 
@@ -69,6 +69,6 @@ loss:
       subspace_dim: 48
       num_subspaces: 4
   curve:
-    enabled: false
+    enabled: true
     weight: 0.1
     step_thresh: 1e-6

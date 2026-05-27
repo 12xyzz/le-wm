@@ -1,0 +1,21 @@
+defaults:
+  - lewm
+
+output_model_name: subspace
+
+loss:
+  sigreg:
+    enabled: true
+    weight: 0.09
+    type: subspace
+    kwargs:
+      knots: 17
+      num_proj: 1024
+    subspace:
+      mode: row-ortho
+      subspace_dim: 48
+      num_subspaces: 4
+      # subspace_dim: 6
+      # num_subspaces: 32
+  curve:
+    enabled: false

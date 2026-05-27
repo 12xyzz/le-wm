@@ -13,7 +13,7 @@ class SIGReg(torch.nn.Module):
     def __init__(self, knots=17, num_proj=1024):
         super().__init__()
         self.num_proj = num_proj
-        t = torch.linspace(0, 3, knots, dtype=torch.float32)
+        t = torch.linspace(0, 3, knots, dtype=torch.float32) # (knots,)
         dt = 3 / (knots - 1)
         weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
         weights[[0, -1]] = dt
@@ -27,14 +27,81 @@ class SIGReg(torch.nn.Module):
         proj: (T, B, D)
         """
         # sample random projections
-        A = torch.randn(proj.size(-1), self.num_proj, device=proj.device)
+        A = torch.randn(proj.size(-1), self.num_proj, device=proj.device) # (D, num_proj)
         A = A.div_(A.norm(p=2, dim=0))
         # compute the epps-pulley statistic
-        x_t = (proj @ A).unsqueeze(-1) * self.t
-        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
-        statistic = (err @ self.weights) * proj.size(-2)
+        # proj @ A = (T, B, D) @ (D, num_proj) = (T, B, num_proj)
+        x_t = (proj @ A).unsqueeze(-1) * self.t # (T, B, num_proj, knots)
+        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square() # (T, num_proj, knots)
+        statistic = (err @ self.weights) * proj.size(-2) # (T, num_proj)
         return statistic.mean() # average over projections and time
-    
+
+
+def _build_subspace_projectors(embed_dim, subspace_dim, num_subspaces, mode="row-ortho"):
+    """
+    Return W: (K, subspace_dim, embed_dim) frozen row-orthonormal projectors.
+
+    row-ortho: each subspace from its own random QR.
+    space-ortho: disjoint column blocks of one shared QR basis.
+    """
+    mode = mode.lower()
+    if mode == "row-ortho":
+        Ws = []
+        for _ in range(num_subspaces):
+            q, _ = torch.linalg.qr(
+                torch.randn(embed_dim, subspace_dim), mode="reduced"
+            )
+            Ws.append(q.T)  # (subspace_dim, embed_dim)
+        return torch.stack(Ws, dim=0)
+
+    if mode == "space-ortho":
+        total_dim = num_subspaces * subspace_dim
+        if total_dim > embed_dim:
+            raise ValueError(
+                f"space-ortho subspaces need num_subspaces * subspace_dim <= embed_dim, "
+                f"got {num_subspaces} * {subspace_dim} = {total_dim} > {embed_dim}"
+            )
+        q, _ = torch.linalg.qr(
+            torch.randn(embed_dim, total_dim), mode="reduced"
+        )  # (embed_dim, total_dim), orthonormal columns
+        Ws = []
+        for k in range(num_subspaces):
+            sl = slice(k * subspace_dim, (k + 1) * subspace_dim)
+            Ws.append(q[:, sl].T)  # (subspace_dim, embed_dim)
+        return torch.stack(Ws, dim=0)
+
+    raise ValueError(f"Unknown subspace mode {mode!r}; use 'row-ortho' or 'space-ortho'.")
+
+
+class SubspaceSIGReg(nn.Module):
+    """SIGReg on K frozen random orthonormal subspace projections."""
+
+    def __init__(self, embed_dim, subspace_dim, num_subspaces, sigreg, mode="row-ortho"):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.subspace_dim = subspace_dim
+        self.num_subspaces = num_subspaces
+        self.mode = mode.lower()
+        self.sigreg = sigreg
+
+        W = _build_subspace_projectors(
+            embed_dim, subspace_dim, num_subspaces, mode=self.mode
+        )
+        self.register_buffer("W", W)  # (K, subspace_dim, embed_dim)
+
+    def forward(self, emb):
+        """
+        emb: (B, T, embed_dim)
+        """
+        losses = []
+        for k in range(self.num_subspaces):
+            # W[k]: (subspace_dim, embed_dim) — project emb into subspace k
+            sub_emb = emb @ self.W[k].T  # (B, T, subspace_dim)
+            loss_k = self.sigreg(sub_emb.transpose(0, 1))  # SIGReg expects (T, B, subspace_dim)
+            losses.append(loss_k)
+        return torch.stack(losses).mean()
+
+
 class FeedForward(nn.Module):
     """FeedForward network used in Transformers"""
 

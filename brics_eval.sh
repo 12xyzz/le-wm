@@ -14,7 +14,7 @@
 set -euo pipefail
 
 LEWM_ROOT="/home/u6gn/xuanya.u6gn/le-wm"
-export STABLEWM_HOME="/scratch/u6gn/xuanya.u6gn/stablewm"
+export STABLEWM_HOME="/projects/u6gn/xuanya.u6gn/stablewm"
 cd "${LEWM_ROOT}"
 
 CKPT="${1:?Usage: sbatch brics_eval.sh /path/to/*_object.ckpt}"
@@ -32,4 +32,5 @@ python eval.py --config-name="${CONFIG_NAME}" policy="${CONFIG_NAME}/${RUN_SUB}/
 LOG_DIR="${LEWM_ROOT}/logs"
 RUN_DIR="$(dirname "$(dirname "$CKPT")")"
 
+mkdir -p "${RUN_DIR}/logs"
 cp "${LOG_DIR}/eval.${SLURM_JOB_ID}.out" "${RUN_DIR}/logs/slurm-eval-${SLURM_JOB_ID}.out"

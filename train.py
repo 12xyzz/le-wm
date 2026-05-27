@@ -10,8 +10,8 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
 from jepa import JEPA
-from module import ARPredictor, Embedder, MLP, SIGReg
-from curve_loss import cosine_curvature_loss
+from module import ARPredictor, Embedder, MLP, SIGReg, SubspaceSIGReg
+from curve_loss import build_curve_loss
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
 
 
@@ -20,13 +20,18 @@ def lejepa_forward(self, batch, stage, cfg):
 
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
-    lambd = cfg.loss.sigreg.weight
+    sigreg_cfg = getattr(cfg.loss, "sigreg", None)
+    sigreg_enabled = bool(sigreg_cfg.enabled) if sigreg_cfg is not None and hasattr(sigreg_cfg, "enabled") else True
+    sigreg_weight = float(sigreg_cfg.weight) if sigreg_cfg is not None and hasattr(sigreg_cfg, "weight") else 0.0
+    sigreg_type = (
+        str(OmegaConf.select(sigreg_cfg, "type", default="full")).lower()
+        if sigreg_cfg is not None
+        else "full"
+    )
 
     curve_cfg = getattr(cfg.loss, "curve", None)
     curve_enabled = bool(curve_cfg.enabled) if curve_cfg is not None and hasattr(curve_cfg, "enabled") else False
     curve_weight = float(curve_cfg.weight) if curve_cfg is not None and hasattr(curve_cfg, "weight") else 0.0
-    curve_step_thresh = float(curve_cfg.step_thresh) if curve_cfg is not None and hasattr(curve_cfg, "step_thresh") else 1e-6
-
     # Replace NaN values with 0 (occurs at sequence boundaries)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
 
@@ -43,14 +48,30 @@ def lejepa_forward(self, batch, stage, cfg):
 
     # LeWM base losses
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
-    output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
-    total_loss = output["pred_loss"] + lambd * output["sigreg_loss"]
+    total_loss = output["pred_loss"]
+    if sigreg_enabled:
+        if sigreg_type == "subspace":
+            if self.subspace_sigreg is None:
+                raise RuntimeError(
+                    "loss.sigreg.type=subspace but subspace_sigreg was not built; "
+                    "check loss.sigreg.subspace in the training config."
+                )
+            output["sigreg_loss"] = self.subspace_sigreg(emb)
+        else:
+            output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
+        total_loss = total_loss + sigreg_weight * output["sigreg_loss"]
 
-    # Optional temporal curvature regularization on the embedding trajectory
+    # Optional temporal curvature regularization.
     if curve_enabled and curve_weight > 0.0:
-        curve_loss = cosine_curvature_loss(emb, step_thresh=curve_step_thresh)
-        output["curve_loss"] = curve_loss
-        total_loss = total_loss + curve_weight * curve_loss
+        curve_features = emb
+        if self.curve_loss is None:
+            raise RuntimeError(
+                "loss.curve is enabled but no curve_loss module was built; "
+                "check loss.curve.type in the training config."
+            )
+        reg = self.curve_loss(curve_features)
+        output[self.curve_loss.log_key] = reg
+        total_loss = total_loss + curve_weight * reg
 
     output["loss"] = total_loss
 
@@ -146,9 +167,41 @@ def run(cfg):
     }
 
     data_module = spt.data.DataModule(train=train, val=val)
+    curve_loss = build_curve_loss(getattr(cfg.loss, "curve", None))
+
+    sigreg_cfg = getattr(cfg.loss, "sigreg", None)
+    sigreg_type = (
+        str(OmegaConf.select(sigreg_cfg, "type", default="full")).lower()
+        if sigreg_cfg is not None
+        else "full"
+    )
+    sigreg = SIGReg(**OmegaConf.to_container(sigreg_cfg.kwargs, resolve=True))
+    subspace_sigreg = None
+    if sigreg_type == "subspace":
+        sub_cfg = OmegaConf.select(sigreg_cfg, "subspace", default={})
+        subspace_dim = int(
+            OmegaConf.select(sub_cfg, "subspace_dim", default=embed_dim // 4)
+        )
+        num_subspaces = int(OmegaConf.select(sub_cfg, "num_subspaces", default=4))
+        subspace_mode = OmegaConf.select(sub_cfg, "mode", default="row-ortho")
+        subspace_mode = (
+            "row-ortho"
+            if subspace_mode in (None, "")
+            else str(subspace_mode).lower()
+        )
+        subspace_sigreg = SubspaceSIGReg(
+            embed_dim=embed_dim,
+            subspace_dim=subspace_dim,
+            num_subspaces=num_subspaces,
+            sigreg=sigreg,
+            mode=subspace_mode,
+        )
+
     world_model = spt.Module(
-        model = world_model,
-        sigreg = SIGReg(**cfg.loss.sigreg.kwargs),
+        model=world_model,
+        sigreg=sigreg,
+        subspace_sigreg=subspace_sigreg,
+        curve_loss=curve_loss,
         forward=partial(lejepa_forward, cfg=cfg),
         optim=optimizers,
     )
@@ -162,6 +215,7 @@ def run(cfg):
     
     ckpt_dir = run_dir / "ckpt"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "logs").mkdir(parents=True, exist_ok=True)
 
     logger = None
     if cfg.wandb.enabled:
