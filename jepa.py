@@ -17,6 +17,10 @@ class JEPA(nn.Module):
         action_encoder,
         projector=None,
         pred_proj=None,
+        model_mode="full",
+        token_predictor=None,
+        num_subspaces=None,
+        subspace_dim=None,
     ):
         super().__init__()
 
@@ -25,6 +29,10 @@ class JEPA(nn.Module):
         self.action_encoder = action_encoder
         self.projector = projector or nn.Identity()
         self.pred_proj = pred_proj or nn.Identity()
+        self.is_token = str(model_mode).lower() == "token"
+        self.token_predictor = token_predictor
+        self.num_subspaces = num_subspaces
+        self.subspace_dim = subspace_dim
 
     def encode(self, info):
         """Encode observations and actions into embeddings.
@@ -49,6 +57,13 @@ class JEPA(nn.Module):
         emb: (B, T, D)
         act_emb: (B, T, A_emb)
         """
+        if self.is_token:
+            if self.token_predictor is None:
+                raise RuntimeError("token mode requires token_predictor to be set.")
+            return self.token_predictor(emb, act_emb)
+
+        if self.predictor is None:
+            raise RuntimeError("predictor is required for non-token modes.")
         preds = self.predictor(emb, act_emb)
         preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))
         preds = rearrange(preds, "(b t) d -> b t d", b=emb.size(0))

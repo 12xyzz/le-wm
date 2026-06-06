@@ -1,13 +1,15 @@
 defaults:
   - lewm
 
-output_model_name: subspace
+output_model_name: row-ortho
+
+model:
+  mode: subspace
 
 loss:
   sigreg:
     enabled: true
     weight: 0.09
-    type: subspace
     kwargs:
       knots: 17
       num_proj: 1024

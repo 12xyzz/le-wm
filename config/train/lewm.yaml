@@ -48,6 +48,13 @@ wm:
   num_preds: 1
   embed_dim: 192
 
+model:
+  mode: full # full | subspace | token
+  token:
+    subspace_dim: 32
+    num_subspaces: null
+    residual: true
+
 predictor:
   depth: 6
   heads: 16
@@ -60,12 +67,11 @@ loss:
   sigreg:
     enabled: true
     weight: 0.09
-    type: full # full | subspace
     kwargs:
       knots: 17
       num_proj: 1024
     subspace:
-      mode: null # row-ortho | space-ortho; null when type=full
+      mode: null # row-ortho | space-ortho; ignored unless model.mode=subspace
       subspace_dim: 48
       num_subspaces: 4
   curve:

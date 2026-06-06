@@ -8,7 +8,7 @@
 #SBATCH --job-name=lewm-eval
 #SBATCH --output=/home/u6gn/xuanya.u6gn/le-wm/logs/eval.%j.out
 #SBATCH --error=/home/u6gn/xuanya.u6gn/le-wm/logs/eval.%j.err
-#SBATCH --time=12:00:00
+#SBATCH --time=00:30:00
 #SBATCH --gpus=1
 
 set -euo pipefail
@@ -27,7 +27,9 @@ STEM="${FILE%_object.ckpt}"
 EPOCH="${STEM##*_epoch_}"
 OUT_NAME="${CONFIG_NAME}_eval_results_${EPOCH}.txt"
 
-python eval.py --config-name="${CONFIG_NAME}" policy="${CONFIG_NAME}/${RUN_SUB}/${STEM}" "output.filename=${OUT_NAME}"
+# Quote policy value for Hydra
+POLICY="${CONFIG_NAME}/${RUN_SUB}/${STEM}"
+python eval.py --config-name="${CONFIG_NAME}" "policy='${POLICY}'" "output.filename=${OUT_NAME}"
 
 LOG_DIR="${LEWM_ROOT}/logs"
 RUN_DIR="$(dirname "$(dirname "$CKPT")")"

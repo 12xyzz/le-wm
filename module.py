@@ -1,4 +1,5 @@
 import torch
+from contextlib import nullcontext
 from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -37,24 +38,45 @@ class SIGReg(torch.nn.Module):
         return statistic.mean() # average over projections and time
 
 
-def _build_subspace_projectors(embed_dim, subspace_dim, num_subspaces, mode="row-ortho"):
-    """
-    Return W: (K, subspace_dim, embed_dim) frozen row-orthonormal projectors.
+def _normalize_orthogonal_mode(mode):
+    """Map config aliases (row, space) to internal projector modes."""
+    mode = str(mode).lower()
+    aliases = {
+        "row": "row-ortho",
+        "row-ortho": "row-ortho",
+        "space": "space-ortho",
+        "space-ortho": "space-ortho",
+    }
+    if mode not in aliases:
+        raise ValueError(
+            f"Unknown orthogonal mode {mode!r}; use 'row' or 'space'."
+        )
+    return aliases[mode]
 
-    row-ortho: each subspace from its own random QR.
-    space-ortho: disjoint column blocks of one shared QR basis.
-    """
-    mode = mode.lower()
-    if mode == "row-ortho":
-        Ws = []
-        for _ in range(num_subspaces):
-            q, _ = torch.linalg.qr(
-                torch.randn(embed_dim, subspace_dim), mode="reduced"
-            )
-            Ws.append(q.T)  # (subspace_dim, embed_dim)
-        return torch.stack(Ws, dim=0)
 
-    if mode == "space-ortho":
+def _build_subspace_projectors(
+    embed_dim, subspace_dim, num_subspaces, mode="row-ortho", seed=None
+):
+    """
+    Return W: (num_subspaces, subspace_dim, embed_dim) SubJEPA-style projectors.
+
+    row-ortho: each W_i has orthonormal rows; subspaces may overlap.
+    space-ortho: disjoint blocks from one global orthogonal basis.
+    """
+    mode = _normalize_orthogonal_mode(mode)
+    rng_ctx = torch.random.fork_rng() if seed is not None else nullcontext()
+    with rng_ctx:
+        if seed is not None:
+            torch.manual_seed(seed)
+        if mode == "row-ortho":
+            Ws = []
+            for _ in range(num_subspaces):
+                q, _ = torch.linalg.qr(
+                    torch.randn(embed_dim, subspace_dim), mode="reduced"
+                )
+                Ws.append(q.T)  # (subspace_dim, embed_dim)
+            return torch.stack(Ws, dim=0)
+
         total_dim = num_subspaces * subspace_dim
         if total_dim > embed_dim:
             raise ValueError(
@@ -63,14 +85,12 @@ def _build_subspace_projectors(embed_dim, subspace_dim, num_subspaces, mode="row
             )
         q, _ = torch.linalg.qr(
             torch.randn(embed_dim, total_dim), mode="reduced"
-        )  # (embed_dim, total_dim), orthonormal columns
+        )
         Ws = []
         for k in range(num_subspaces):
             sl = slice(k * subspace_dim, (k + 1) * subspace_dim)
-            Ws.append(q[:, sl].T)  # (subspace_dim, embed_dim)
+            Ws.append(q[:, sl].T)
         return torch.stack(Ws, dim=0)
-
-    raise ValueError(f"Unknown subspace mode {mode!r}; use 'row-ortho' or 'space-ortho'.")
 
 
 class SubspaceSIGReg(nn.Module):
@@ -139,7 +159,7 @@ class Attention(nn.Module):
             else nn.Identity()
         )
 
-    def forward(self, x, causal=True):
+    def forward(self, x, causal=True, attn_mask=None):
         """
         x : (B, T, D)
         """
@@ -147,7 +167,14 @@ class Attention(nn.Module):
         drop = self.dropout if self.training else 0.0
         qkv = self.to_qkv(x).chunk(3, dim=-1)  # q, k, v: (B, heads, T, dim_head)
         q, k, v = (rearrange(t, "b t (h d) -> b h t d", h=self.heads) for t in qkv)
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=causal)
+        if attn_mask is not None:
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, dropout_p=drop, is_causal=False
+            )
+        else:
+            out = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=drop, is_causal=causal
+            )
         out = rearrange(out, "b h t d -> b t (h d)")
         return self.to_out(out)
 
@@ -169,11 +196,13 @@ class ConditionalBlock(nn.Module):
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-    def forward(self, x, c):
+    def forward(self, x, c, attn_mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )
-        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_msa * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa), attn_mask=attn_mask
+        )
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -189,8 +218,8 @@ class Block(nn.Module):
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
 
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
+    def forward(self, x, attn_mask=None):
+        x = x + self.attn(self.norm1(x), attn_mask=attn_mask)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -237,7 +266,7 @@ class Transformer(nn.Module):
                 block_class(hidden_dim, heads, dim_head, mlp_dim, dropout)
             )
 
-    def forward(self, x, c=None):
+    def forward(self, x, c=None, attn_mask=None):
 
         if hasattr(self, "input_proj"):
             x = self.input_proj(x)
@@ -246,7 +275,10 @@ class Transformer(nn.Module):
             c = self.cond_proj(c)
 
         for block in self.layers:
-            x = block(x) if isinstance(block, Block) else block(x, c)
+            if isinstance(block, Block):
+                x = block(x, attn_mask=attn_mask)
+            else:
+                x = block(x, c, attn_mask=attn_mask)
         x = self.norm(x)
 
         if hasattr(self, "output_proj"):
@@ -350,3 +382,164 @@ class ARPredictor(nn.Module):
         x = self.dropout(x)
         x = self.transformer(x, c)
         return x
+
+
+def _visible_keys_from_mask(mask, query_idx):
+    """Return key indices allowed for a query row."""
+    neg_inf = torch.finfo(mask.dtype).min if mask.dtype.is_floating_point else float("-inf")
+    return (mask[query_idx] > neg_inf / 2).nonzero(as_tuple=False).squeeze(-1)
+
+
+def _assert_block_causal_mask_sanity():
+    """Validate block-causal mask: visibility depends on frame index."""
+    T, K = 3, 4
+    mask = TokenARPredictor.make_block_causal_mask(
+        T, K, device=torch.device("cpu"), dtype=torch.float32
+    )
+
+    q_t1_k0 = 1 * K + 0
+    q_t1_k3 = 1 * K + 3
+    q_t2_k1 = 2 * K + 1
+
+    vis_t1_k0 = _visible_keys_from_mask(mask, q_t1_k0)
+    vis_t1_k3 = _visible_keys_from_mask(mask, q_t1_k3)
+    vis_t2_k1 = _visible_keys_from_mask(mask, q_t2_k1)
+
+    expected_t1 = torch.arange((1 + 1) * K, dtype=torch.long)  # frames 0 and 1
+    expected_t2 = torch.arange((2 + 1) * K, dtype=torch.long)  # frames 0, 1, 2
+
+    assert torch.equal(vis_t1_k0, expected_t1), vis_t1_k0
+    assert torch.equal(vis_t1_k3, expected_t1), vis_t1_k3
+    assert torch.equal(vis_t1_k0, vis_t1_k3)
+    assert torch.equal(vis_t2_k1, expected_t2), vis_t2_k1
+
+    frame2_keys = torch.arange(2 * K, T * K, dtype=torch.long)
+    assert not any(k in vis_t1_k0.tolist() for k in frame2_keys.tolist())
+
+
+class TokenARPredictor(nn.Module):
+    """Autoregressive predictor over coordinate-aligned subspace tokens.
+
+    ARPredictor uses T tokens of dimension D. TokenARPredictor splits each
+    D-dimensional token into K coordinate-aligned subspace tokens of dimension d,
+    and runs the same ConditionalBlock Transformer over T*K tokens.
+    The block-causal mask is used to ensure that the transformer only attends to
+    tokens in the same or earlier frames.
+    Action conditioning is preserved via AdaLN-zero by projecting action embeddings
+    into token-aligned condition tokens.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_frames,
+        depth,
+        heads,
+        mlp_dim,
+        input_dim,
+        hidden_dim,
+        dim_head=64,
+        dropout=0.0,
+        emb_dropout=0.0,
+        action_dim=None,
+        subspace_dim=32,
+        num_subspaces=None,
+        residual=True,
+    ):
+        super().__init__()
+        action_dim = input_dim if action_dim is None else action_dim
+        if num_subspaces is None:
+            if input_dim % subspace_dim != 0:
+                raise ValueError(
+                    f"num_subspaces=None requires input_dim % subspace_dim == 0, "
+                    f"got {input_dim} % {subspace_dim}"
+                )
+            num_subspaces = input_dim // subspace_dim
+        if num_subspaces * subspace_dim != input_dim:
+            raise ValueError(
+                f"require num_subspaces * subspace_dim == input_dim, "
+                f"got {num_subspaces} * {subspace_dim} != {input_dim}"
+            )
+
+        self.input_dim = input_dim
+        self.output_dim = input_dim
+        self.action_dim = action_dim
+        self.subspace_dim = subspace_dim
+        self.num_subspaces = num_subspaces
+        self.num_frames = num_frames
+        self.residual = residual
+
+        self.time_embedding = nn.Parameter(
+            torch.zeros(1, num_frames, 1, subspace_dim)
+        )
+        self.subspace_embedding = nn.Parameter(
+            torch.zeros(1, 1, num_subspaces, subspace_dim)
+        )
+        nn.init.normal_(self.time_embedding, std=0.02)
+        nn.init.normal_(self.subspace_embedding, std=0.02)
+        self.dropout = nn.Dropout(emb_dropout)
+        self.cond_proj = nn.Linear(action_dim, num_subspaces * subspace_dim)
+        self.transformer = Transformer(
+            input_dim=subspace_dim,
+            hidden_dim=hidden_dim,
+            output_dim=subspace_dim,
+            depth=depth,
+            heads=heads,
+            dim_head=dim_head,
+            mlp_dim=mlp_dim,
+            dropout=dropout,
+            block_class=ConditionalBlock,
+        )
+        self.out_proj = nn.Sequential(
+            nn.LayerNorm(subspace_dim),
+            nn.Linear(subspace_dim, subspace_dim),
+        )
+        nn.init.zeros_(self.out_proj[-1].weight)
+        nn.init.zeros_(self.out_proj[-1].bias)
+        # _assert_block_causal_mask_sanity()
+
+    @staticmethod
+    def make_block_causal_mask(T, K, device, dtype):
+        idx = torch.arange(T * K, device=device)
+        q_frame = idx[:, None] // K
+        k_frame = idx[None, :] // K
+        allowed = k_frame <= q_frame
+
+        mask = torch.zeros(T * K, T * K, device=device, dtype=dtype)
+        neg_inf = torch.finfo(dtype).min if dtype.is_floating_point else float("-inf")
+        mask = mask.masked_fill(~allowed, neg_inf)
+        return mask
+
+    def forward(self, x, c):
+        """
+        x: [B, T, D]
+        c: [B, T, action_dim]
+        return: [B, T, D]
+        """
+        B, T, D = x.shape
+        K = self.num_subspaces
+        d = self.subspace_dim
+        if D != self.input_dim:
+            raise ValueError(f"Expected x last dim {self.input_dim}, got {D}")
+        if T > self.num_frames:
+            raise ValueError(f"Expected T <= num_frames ({self.num_frames}), got T={T}")
+        if c.shape[0] != B or c.shape[1] != T or c.shape[-1] != self.action_dim:
+            raise ValueError(
+                f"Expected c shape [B, T, {self.action_dim}] matching x batch/time, "
+                f"got {tuple(c.shape)}"
+            )
+
+        x_tok = x.contiguous().view(B, T, K, d)
+        cond_tok = self.cond_proj(c).view(B, T, K, d)
+
+        h = x_tok + self.time_embedding[:, :T] + self.subspace_embedding
+        h = self.dropout(h)
+        h = h.reshape(B, T * K, d)
+        cond_tok = cond_tok.reshape(B, T * K, d)
+        attn_mask = self.make_block_causal_mask(T, K, h.device, h.dtype)
+        h = self.transformer(h, cond_tok, attn_mask=attn_mask)
+        h = h.view(B, T, K, d)
+
+        delta = self.out_proj(h)
+        y_tok = x_tok + delta if self.residual else delta
+        return y_tok.flatten(-2)

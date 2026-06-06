@@ -10,9 +10,24 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
 from jepa import JEPA
-from module import ARPredictor, Embedder, MLP, SIGReg, SubspaceSIGReg
+from module import (
+    ARPredictor,
+    Embedder,
+    MLP,
+    SIGReg,
+    SubspaceSIGReg,
+    TokenARPredictor,
+)
 from curve_loss import build_curve_loss
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
+
+def get_model_mode(cfg):
+    model_cfg = getattr(cfg, "model", None)
+    return (
+        str(OmegaConf.select(model_cfg, "mode", default="full")).lower()
+        if model_cfg is not None
+        else "full"
+    )
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -20,14 +35,11 @@ def lejepa_forward(self, batch, stage, cfg):
 
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
+    model_mode = get_model_mode(cfg)
     sigreg_cfg = getattr(cfg.loss, "sigreg", None)
     sigreg_enabled = bool(sigreg_cfg.enabled) if sigreg_cfg is not None and hasattr(sigreg_cfg, "enabled") else True
     sigreg_weight = float(sigreg_cfg.weight) if sigreg_cfg is not None and hasattr(sigreg_cfg, "weight") else 0.0
-    sigreg_type = (
-        str(OmegaConf.select(sigreg_cfg, "type", default="full")).lower()
-        if sigreg_cfg is not None
-        else "full"
-    )
+    use_subspace_sigreg = model_mode == "subspace"
 
     curve_cfg = getattr(cfg.loss, "curve", None)
     curve_enabled = bool(curve_cfg.enabled) if curve_cfg is not None and hasattr(curve_cfg, "enabled") else False
@@ -44,17 +56,21 @@ def lejepa_forward(self, batch, stage, cfg):
     ctx_act = act_emb[:, : ctx_len]
 
     tgt_emb = emb[:, n_preds:]  # label
+
     pred_emb = self.model.predict(ctx_emb, ctx_act)  # pred
+    assert pred_emb.shape == tgt_emb.shape, (
+        f"pred_emb shape {pred_emb.shape} != tgt_emb shape {tgt_emb.shape}"
+    )
 
     # LeWM base losses
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
     total_loss = output["pred_loss"]
     if sigreg_enabled:
-        if sigreg_type == "subspace":
+        if use_subspace_sigreg:
             if self.subspace_sigreg is None:
                 raise RuntimeError(
-                    "loss.sigreg.type=subspace but subspace_sigreg was not built; "
-                    "check loss.sigreg.subspace in the training config."
+                    "subspace SIGReg requested but subspace_sigreg was not built; "
+                    "check model.mode and loss.sigreg in the training config."
                 )
             output["sigreg_loss"] = self.subspace_sigreg(emb)
         else:
@@ -75,8 +91,9 @@ def lejepa_forward(self, batch, stage, cfg):
 
     output["loss"] = total_loss
 
-    losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
-    self.log_dict(losses_dict, on_step=True, sync_dist=True)
+    log_keys = {k for k in output if "loss" in k}
+    log_dict = {f"{stage}/{k}": output[k].detach() for k in log_keys if k in output}
+    self.log_dict(log_dict, on_step=True, sync_dist=True)
     return output
 
 @hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
@@ -124,14 +141,49 @@ def run(cfg):
     hidden_dim = encoder.config.hidden_size
     embed_dim = cfg.wm.get("embed_dim", hidden_dim)
     effective_act_dim = cfg.data.dataset.frameskip * cfg.wm.action_dim
+    model_mode = get_model_mode(cfg)
 
-    predictor = ARPredictor(
-        num_frames=cfg.wm.history_size,
-        input_dim=embed_dim,
-        hidden_dim=hidden_dim,
-        output_dim=hidden_dim,
-        **cfg.predictor,
-    )
+    pred_output_dim = embed_dim
+    token_predictor = None
+    token_num_subspaces = None
+    token_subspace_dim = None
+
+    if model_mode == "token":
+        token_cfg = OmegaConf.select(cfg, "model.token", default={})
+        token_subspace_dim = int(OmegaConf.select(token_cfg, "subspace_dim", default=32))
+        token_num_subspaces = OmegaConf.select(
+            token_cfg, "num_subspaces", default=None
+        )
+        token_num_subspaces = (
+            None
+            if token_num_subspaces in (None, "")
+            else int(token_num_subspaces)
+        )
+        token_residual = bool(OmegaConf.select(token_cfg, "residual", default=True))
+        predictor_kwargs = OmegaConf.to_container(cfg.predictor, resolve=True)
+        for key in ("input_dim", "hidden_dim", "output_dim"):
+            predictor_kwargs.pop(key, None)
+        token_predictor = TokenARPredictor(
+            num_frames=cfg.wm.history_size,
+            input_dim=embed_dim,
+            action_dim=embed_dim,
+            subspace_dim=token_subspace_dim,
+            num_subspaces=token_num_subspaces,
+            hidden_dim=hidden_dim,
+            residual=token_residual,
+            **predictor_kwargs,
+        )
+        token_num_subspaces = token_predictor.num_subspaces
+        token_subspace_dim = token_predictor.subspace_dim
+        predictor = None
+    else:
+        predictor = ARPredictor(
+            num_frames=cfg.wm.history_size,
+            input_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim,
+            **cfg.predictor,
+        )
 
     action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
     
@@ -144,7 +196,7 @@ def run(cfg):
 
     predictor_proj = MLP(
         input_dim=hidden_dim,
-        output_dim=embed_dim,
+        output_dim=pred_output_dim,
         hidden_dim=2048,
         norm_fn=torch.nn.BatchNorm1d,
     )
@@ -155,6 +207,10 @@ def run(cfg):
         action_encoder=action_encoder,
         projector=projector,
         pred_proj=predictor_proj,
+        model_mode=model_mode,
+        token_predictor=token_predictor,
+        num_subspaces=token_num_subspaces,
+        subspace_dim=token_subspace_dim,
     )
 
     optimizers = {
@@ -170,14 +226,10 @@ def run(cfg):
     curve_loss = build_curve_loss(getattr(cfg.loss, "curve", None))
 
     sigreg_cfg = getattr(cfg.loss, "sigreg", None)
-    sigreg_type = (
-        str(OmegaConf.select(sigreg_cfg, "type", default="full")).lower()
-        if sigreg_cfg is not None
-        else "full"
-    )
+    use_subspace_sigreg = model_mode == "subspace"
     sigreg = SIGReg(**OmegaConf.to_container(sigreg_cfg.kwargs, resolve=True))
     subspace_sigreg = None
-    if sigreg_type == "subspace":
+    if use_subspace_sigreg:
         sub_cfg = OmegaConf.select(sigreg_cfg, "subspace", default={})
         subspace_dim = int(
             OmegaConf.select(sub_cfg, "subspace_dim", default=embed_dim // 4)

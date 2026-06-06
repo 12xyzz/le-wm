@@ -31,9 +31,11 @@ This codebase builds on [stable-worldmodel](https://github.com/galilai-group/sta
 
 **Installation:**
 ```bash
-uv venv --python=3.10
-source .venv/bin/activate
-uv pip install stable-worldmodel[train,env]
+conda create -n lewm python=3.10 -y
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate lewm
+conda install -c conda-forge swig
+pip install stable-worldmodel[train,env]
 ```
 
 ## Data
