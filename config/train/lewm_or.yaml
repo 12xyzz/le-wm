@@ -1,7 +1,7 @@
 defaults:
   - lewm
 
-output_model_name: row-ortho
+output_model_name: row_ortho
 
 model:
   mode: subspace

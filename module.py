@@ -207,25 +207,8 @@ class ConditionalBlock(nn.Module):
         return x
 
 
-class Block(nn.Module):
-    """Standard Transformer block"""
-
-    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
-        super().__init__()
-
-        self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
-        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
-        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-
-    def forward(self, x, attn_mask=None):
-        x = x + self.attn(self.norm1(x), attn_mask=attn_mask)
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
 class Transformer(nn.Module):
-    """Standard Transformer with support for AdaLN-zero blocks"""
+    """Transformer with AdaLN-zero conditioning blocks."""
 
     def __init__(
         self,
@@ -237,7 +220,7 @@ class Transformer(nn.Module):
         dim_head,
         mlp_dim,
         dropout=0.0,
-        block_class=Block,
+        block_class=ConditionalBlock,
     ):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim)
@@ -275,10 +258,7 @@ class Transformer(nn.Module):
             c = self.cond_proj(c)
 
         for block in self.layers:
-            if isinstance(block, Block):
-                x = block(x, attn_mask=attn_mask)
-            else:
-                x = block(x, c, attn_mask=attn_mask)
+            x = block(x, c, attn_mask=attn_mask)
         x = self.norm(x)
 
         if hasattr(self, "output_proj"):
@@ -384,39 +364,6 @@ class ARPredictor(nn.Module):
         return x
 
 
-def _visible_keys_from_mask(mask, query_idx):
-    """Return key indices allowed for a query row."""
-    neg_inf = torch.finfo(mask.dtype).min if mask.dtype.is_floating_point else float("-inf")
-    return (mask[query_idx] > neg_inf / 2).nonzero(as_tuple=False).squeeze(-1)
-
-
-def _assert_block_causal_mask_sanity():
-    """Validate block-causal mask: visibility depends on frame index."""
-    T, K = 3, 4
-    mask = TokenARPredictor.make_block_causal_mask(
-        T, K, device=torch.device("cpu"), dtype=torch.float32
-    )
-
-    q_t1_k0 = 1 * K + 0
-    q_t1_k3 = 1 * K + 3
-    q_t2_k1 = 2 * K + 1
-
-    vis_t1_k0 = _visible_keys_from_mask(mask, q_t1_k0)
-    vis_t1_k3 = _visible_keys_from_mask(mask, q_t1_k3)
-    vis_t2_k1 = _visible_keys_from_mask(mask, q_t2_k1)
-
-    expected_t1 = torch.arange((1 + 1) * K, dtype=torch.long)  # frames 0 and 1
-    expected_t2 = torch.arange((2 + 1) * K, dtype=torch.long)  # frames 0, 1, 2
-
-    assert torch.equal(vis_t1_k0, expected_t1), vis_t1_k0
-    assert torch.equal(vis_t1_k3, expected_t1), vis_t1_k3
-    assert torch.equal(vis_t1_k0, vis_t1_k3)
-    assert torch.equal(vis_t2_k1, expected_t2), vis_t2_k1
-
-    frame2_keys = torch.arange(2 * K, T * K, dtype=torch.long)
-    assert not any(k in vis_t1_k0.tolist() for k in frame2_keys.tolist())
-
-
 class TokenARPredictor(nn.Module):
     """Autoregressive predictor over coordinate-aligned subspace tokens.
 
@@ -496,7 +443,6 @@ class TokenARPredictor(nn.Module):
         )
         nn.init.zeros_(self.out_proj[-1].weight)
         nn.init.zeros_(self.out_proj[-1].bias)
-        # _assert_block_causal_mask_sanity()
 
     @staticmethod
     def make_block_causal_mask(T, K, device, dtype):

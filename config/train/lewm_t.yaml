@@ -6,6 +6,7 @@ output_model_name: token
 model:
   mode: token
   token:
-    subspace_dim: 48
-    num_subspaces: 4
+    subspace_dim: 96
+    num_subspaces: 2
     residual: true
+    decouple_loss: false

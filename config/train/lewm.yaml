@@ -3,10 +3,10 @@ defaults:
   - data: pusht # CLI overrides: python train.py data=<name>
   - launcher: local
 
-STABLEWM_HOME: "/projects/u6gn/xuanya.u6gn/stablewm"
+STABLEWM_HOME: "/projects/u6mw/xuanya.u6mw/stablewm"
 output_model_name: base
 subdir: ${now:%m%d%H%M}_${oc.env:SLURM_JOB_ID,local}
-run_dir: ${STABLEWM_HOME}/${data.preset}/${subdir}
+run_dir: ${STABLEWM_HOME}/checkpoints/${data.preset}/${subdir}
 
 num_workers: 6
 train_split: 0.9
@@ -54,6 +54,7 @@ model:
     subspace_dim: 32
     num_subspaces: null
     residual: true
+    decouple_loss: false
 
 predictor:
   depth: 6

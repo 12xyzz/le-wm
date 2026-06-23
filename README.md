@@ -37,6 +37,11 @@ conda activate lewm
 conda install -c conda-forge swig
 pip install stable-worldmodel[train,env]
 ```
+```bash
+pip install hdf5plugin
+pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu126
+pip install "mujoco==3.6.0" "dm-control==1.0.38"
+```
 
 ## Data
 

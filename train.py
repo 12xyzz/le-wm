@@ -30,6 +30,34 @@ def get_model_mode(cfg):
     )
 
 
+def get_token_decouple_loss(cfg):
+    if get_model_mode(cfg) != "token":
+        return False
+    return bool(OmegaConf.select(cfg, "model.token.decouple_loss", default=False))
+
+
+def _token_subspace_slices(model, cfg):
+    subspace_dim = int(
+        getattr(model, "subspace_dim", None)
+        or OmegaConf.select(cfg, "model.token.subspace_dim", default=cfg.wm.embed_dim // 2)
+    )
+    num_subspaces = int(
+        getattr(model, "num_subspaces", None)
+        or OmegaConf.select(cfg, "model.token.num_subspaces", default=2)
+    )
+    if num_subspaces != 2:
+        raise RuntimeError(
+            f"model.token.decouple_loss requires num_subspaces=2, got {num_subspaces}"
+        )
+    embed_dim = int(cfg.wm.embed_dim)
+    if num_subspaces * subspace_dim != embed_dim:
+        raise RuntimeError(
+            f"model.token.decouple_loss requires num_subspaces * subspace_dim == embed_dim, "
+            f"got {num_subspaces} * {subspace_dim} != {embed_dim}"
+        )
+    return slice(0, subspace_dim), slice(subspace_dim, embed_dim), subspace_dim
+
+
 def lejepa_forward(self, batch, stage, cfg):
     """encode observations, predict next states, compute losses."""
 
@@ -40,6 +68,7 @@ def lejepa_forward(self, batch, stage, cfg):
     sigreg_enabled = bool(sigreg_cfg.enabled) if sigreg_cfg is not None and hasattr(sigreg_cfg, "enabled") else True
     sigreg_weight = float(sigreg_cfg.weight) if sigreg_cfg is not None and hasattr(sigreg_cfg, "weight") else 0.0
     use_subspace_sigreg = model_mode == "subspace"
+    decouple_token_loss = get_token_decouple_loss(cfg)
 
     curve_cfg = getattr(cfg.loss, "curve", None)
     curve_enabled = bool(curve_cfg.enabled) if curve_cfg is not None and hasattr(curve_cfg, "enabled") else False
@@ -73,13 +102,21 @@ def lejepa_forward(self, batch, stage, cfg):
                     "check model.mode and loss.sigreg in the training config."
                 )
             output["sigreg_loss"] = self.subspace_sigreg(emb)
+        elif decouple_token_loss:
+            _, sigreg_slice, _ = _token_subspace_slices(self.model, cfg)
+            sigreg_emb = emb[..., sigreg_slice]
+            output["sigreg_loss"] = self.sigreg(sigreg_emb.transpose(0, 1))
         else:
             output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
         total_loss = total_loss + sigreg_weight * output["sigreg_loss"]
 
     # Optional temporal curvature regularization.
     if curve_enabled and curve_weight > 0.0:
-        curve_features = emb
+        if decouple_token_loss:
+            curve_slice, _, _ = _token_subspace_slices(self.model, cfg)
+            curve_features = emb[..., curve_slice]
+        else:
+            curve_features = emb
         if self.curve_loss is None:
             raise RuntimeError(
                 "loss.curve is enabled but no curve_loss module was built; "
@@ -150,9 +187,9 @@ def run(cfg):
 
     if model_mode == "token":
         token_cfg = OmegaConf.select(cfg, "model.token", default={})
-        token_subspace_dim = int(OmegaConf.select(token_cfg, "subspace_dim", default=32))
+        token_subspace_dim = int(OmegaConf.select(token_cfg, "subspace_dim", default=48))
         token_num_subspaces = OmegaConf.select(
-            token_cfg, "num_subspaces", default=None
+            token_cfg, "num_subspaces", default=4
         )
         token_num_subspaces = (
             None
@@ -160,6 +197,15 @@ def run(cfg):
             else int(token_num_subspaces)
         )
         token_residual = bool(OmegaConf.select(token_cfg, "residual", default=True))
+        decouple_loss = bool(OmegaConf.select(token_cfg, "decouple_loss", default=False))
+        if decouple_loss and token_num_subspaces not in (None, 2):
+            raise ValueError(
+                f"model.token.decouple_loss requires num_subspaces=2, got {token_num_subspaces}"
+            )
+        if decouple_loss and token_num_subspaces is None and embed_dim % 2 != 0:
+            raise ValueError(
+                "model.token.decouple_loss with num_subspaces=None requires embed_dim % 2 == 0"
+            )
         predictor_kwargs = OmegaConf.to_container(cfg.predictor, resolve=True)
         for key in ("input_dim", "hidden_dim", "output_dim"):
             predictor_kwargs.pop(key, None)
@@ -277,8 +323,12 @@ def run(cfg):
     with open(run_dir / "config.yaml", "w") as f:
         OmegaConf.save(cfg, f)
 
+    dump_epoch_interval = int(OmegaConf.select(cfg, "dump_epoch_interval", default=5))
+
     object_dump_callback = ModelObjectCallBack(
-        dirpath=ckpt_dir, filename=cfg.output_model_name, epoch_interval=1,
+        dirpath=ckpt_dir,
+        filename=cfg.output_model_name,
+        epoch_interval=dump_epoch_interval,
     )
 
     trainer = pl.Trainer(
@@ -290,11 +340,12 @@ def run(cfg):
         enable_checkpointing=False,
     )
 
+    weights_ckpt = (ckpt_dir / f"{cfg.output_model_name}_weights.ckpt").resolve()
     manager = spt.Manager(
         trainer=trainer,
         module=world_model,
         data=data_module,
-        ckpt_path=ckpt_dir / f"{cfg.output_model_name}_weights.ckpt",
+        ckpt_path=weights_ckpt if weights_ckpt.is_file() else None,
     )
 
     manager()

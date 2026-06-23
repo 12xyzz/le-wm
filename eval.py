@@ -37,14 +37,23 @@ def get_episodes_length(dataset, episodes):
     return np.array(lengths)
 
 
+def stablewm_home() -> Path:
+    return Path(os.environ.get("STABLEWM_HOME", swm.data.utils.get_cache_dir()))
+
+
 def get_dataset(cfg, dataset_name):
-    dataset_path = Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
+    h5_path = stablewm_home() / "datasets" / f"{dataset_name}.h5"
     dataset = swm.data.HDF5Dataset(
-        dataset_name,
+        path=str(h5_path),
         keys_to_cache=cfg.dataset.keys_to_cache,
-        cache_dir=dataset_path,
     )
     return dataset
+
+
+def policy_run_dir(policy: str) -> Path:
+    # policy: <task>/<run>/ckpt/<stem>
+    policy_path = Path(policy)
+    return stablewm_home() / "checkpoints" / policy_path.parent.parent
 
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
@@ -99,13 +108,12 @@ def run(cfg: DictConfig):
     else:
         policy = swm.policy.RandomPolicy()
 
-    results_base = (
-        Path(swm.data.utils.get_cache_dir(), cfg.policy).parent
-        if cfg.policy != "random"
-        else Path(__file__).parent
-    )
-
-    rollout_dir = (results_base.parent if cfg.policy != "random" else results_base) / "rollout"
+    if cfg.policy != "random":
+        run_dir = policy_run_dir(cfg.policy)
+        rollout_dir = run_dir / "rollout"
+    else:
+        run_dir = Path(__file__).parent
+        rollout_dir = run_dir / "rollout"
     rollout_dir.mkdir(parents=True, exist_ok=True)
 
     # sample the episodes and the starting indices
@@ -142,20 +150,20 @@ def run(cfg: DictConfig):
     world.set_policy(policy)
 
     start_time = time.time()
-    metrics = world.evaluate_from_dataset(
-        dataset,
+    metrics = world.evaluate(
+        dataset=dataset,
         start_steps=eval_start_idx.tolist(),
-        goal_offset_steps=cfg.eval.goal_offset_steps,
+        goal_offset=cfg.eval.goal_offset_steps,
         eval_budget=cfg.eval.eval_budget,
         episodes_idx=eval_episodes.tolist(),
         callables=OmegaConf.to_container(cfg.eval.get("callables"), resolve=True),
-        video_path=rollout_dir,
+        video=rollout_dir,
     )
     end_time = time.time()
     
     print(metrics)
     
-    results_file = (results_base.parent if cfg.policy != "random" else results_base) / cfg.output.filename
+    results_file = run_dir / cfg.output.filename
     results_file.parent.mkdir(parents=True, exist_ok=True)
 
     with results_file.open("a") as f:

@@ -73,13 +73,27 @@ class JEPA(nn.Module):
     ## Inference only ##
     ####################
 
-    def rollout(self, info, action_sequence, history_size: int = 3):
+    def _inference_history_size(self) -> int:
+        if self.is_token:
+            if self.token_predictor is not None:
+                return int(self.token_predictor.num_frames)
+        elif self.predictor is not None:
+            num_frames = getattr(self.predictor, "num_frames", None)
+            if num_frames is not None:
+                return int(num_frames)
+            if hasattr(self.predictor, "pos_embedding"):
+                return int(self.predictor.pos_embedding.shape[1])
+        raise RuntimeError("could not infer history_size from checkpoint")
+
+    def rollout(self, info, action_sequence, history_size: int | None = None):
         """Rollout the model given an initial info dict and action sequence.
         pixels: (B, S, T, C, H, W)
         action_sequence: (B, S, T, action_dim)
          - S is the number of action plan samples
          - T is the time horizon
         """
+        if history_size is None:
+            history_size = self._inference_history_size()
 
         assert "pixels" in info, "pixels not in info_dict"
         H = info["pixels"].size(2)

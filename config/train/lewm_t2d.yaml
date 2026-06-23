@@ -1,0 +1,20 @@
+defaults:
+  - lewm
+
+output_model_name: token_2_decouple
+
+model:
+  mode: token
+  token:
+    subspace_dim: 96
+    num_subspaces: 2
+    residual: true
+    decouple_loss: true
+
+loss:
+  sigreg:
+    enabled: true
+    weight: 0.09
+  curve:
+    enabled: true
+    weight: 0.1
